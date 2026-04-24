@@ -1,0 +1,189 @@
+-- ============================================================
+-- 01_monthly_revenue.sql
+-- Monthly revenue trend
+-- Concepts: DATE_TRUNC, SUM, JOIN, WHERE filter
+-- ============================================================
+CREATE OR REPLACE VIEW `olist_raw.vw_monthly_revenue` AS
+SELECT
+  DATE_TRUNC(o.order_purchase_timestamp, MONTH) AS order_month,
+  COUNT(DISTINCT o.order_id)                    AS total_orders,
+  ROUND(SUM(p.payment_value), 2)                AS total_revenue,
+  ROUND(AVG(p.payment_value), 2)                AS avg_order_value
+FROM `olist_raw.orders` o
+JOIN `olist_raw.order_payments` p
+  ON o.order_id = p.order_id
+WHERE o.order_status = 'delivered'
+GROUP BY 1
+ORDER BY 1;
+
+
+-- ============================================================
+-- 02_category_revenue.sql
+-- Top product categories by revenue
+-- Concepts: Multi-table JOIN, COALESCE, subquery alias
+-- ============================================================
+CREATE OR REPLACE VIEW `olist_raw.vw_category_revenue` AS
+WITH clean_translation AS (
+  SELECT 
+    string_field_0 AS cat_pt, 
+    string_field_1 AS cat_en 
+  FROM `olist_raw.category_translation`
+  WHERE string_field_0 != 'product_category_name'
+)
+SELECT
+  COALESCE(t.cat_en, p.product_category_name, 'Unknown') AS category,
+  COUNT(DISTINCT oi.order_id)                  AS total_orders,
+  ROUND(SUM(oi.price), 2)                      AS total_revenue,
+  ROUND(AVG(oi.price), 2)                      AS avg_item_price,
+  COUNT(DISTINCT oi.product_id)                AS unique_products
+FROM `olist_raw.order_items` oi
+JOIN `olist_raw.orders` o
+  ON oi.order_id = o.order_id
+JOIN `olist_raw.products` p
+  ON oi.product_id = p.product_id
+LEFT JOIN clean_translation t
+  ON p.product_category_name = t.cat_pt
+WHERE o.order_status = 'delivered'
+GROUP BY 1
+ORDER BY total_revenue DESC
+LIMIT 20;
+
+
+-- ============================================================
+-- 03_customer_rfm.sql
+-- RFM customer segmentation (Recency, Frequency, Monetary)
+-- Concepts: CTEs, NTILE, CASE WHEN, window functions
+-- ============================================================
+CREATE OR REPLACE VIEW `olist_raw.vw_customer_rfm` AS
+WITH base AS (
+  SELECT
+    o.customer_id,
+    DATE_DIFF(DATE '2018-10-01',
+      MAX(DATE(o.order_purchase_timestamp)), DAY) AS recency_days,
+    COUNT(DISTINCT o.order_id)                    AS frequency,
+    ROUND(SUM(p.payment_value), 2)                AS monetary
+  FROM `olist_raw.orders` o
+  JOIN `olist_raw.order_payments` p
+    ON o.order_id = p.order_id
+  WHERE o.order_status = 'delivered'
+  GROUP BY 1
+),
+scored AS (
+  SELECT *,
+    NTILE(4) OVER (ORDER BY recency_days DESC) AS r_score,
+    NTILE(4) OVER (ORDER BY frequency ASC)     AS f_score,
+    NTILE(4) OVER (ORDER BY monetary ASC)      AS m_score
+  FROM base
+)
+SELECT *,
+  CASE
+    WHEN r_score = 4 AND f_score >= 3 THEN 'Champion'
+    WHEN r_score >= 3 AND f_score >= 2 THEN 'Loyal'
+    WHEN r_score >= 3 AND f_score = 1  THEN 'Promising'
+    WHEN r_score = 2                   THEN 'At Risk'
+    WHEN r_score = 1                   THEN 'Lost'
+    ELSE 'Others'
+  END AS rfm_segment
+FROM scored;
+
+
+-- ============================================================
+-- 04_seller_performance.sql
+-- Seller performance scorecard
+-- Concepts: TIMESTAMP_DIFF, AVG, HAVING
+-- ============================================================
+CREATE OR REPLACE VIEW `olist_raw.vw_seller_performance` AS
+SELECT
+  s.seller_id,
+  s.seller_city,
+  s.seller_state,
+  COUNT(DISTINCT oi.order_id)                AS total_orders,
+  ROUND(SUM(oi.price), 2)                    AS total_revenue,
+  ROUND(AVG(r.review_score), 2)              AS avg_review_score,
+  ROUND(AVG(TIMESTAMP_DIFF(
+    o.order_delivered_customer_date,
+    o.order_purchase_timestamp, DAY)), 1)    AS avg_delivery_days
+FROM `olist_raw.sellers` s
+JOIN `olist_raw.order_items` oi  ON s.seller_id   = oi.seller_id
+JOIN `olist_raw.orders` o        ON oi.order_id   = o.order_id
+JOIN `olist_raw.order_reviews` r ON o.order_id    = r.order_id
+WHERE o.order_status = 'delivered'
+  AND o.order_delivered_customer_date IS NOT NULL
+GROUP BY 1,2,3
+HAVING total_orders >= 10
+ORDER BY total_revenue DESC;
+
+
+-- ============================================================
+-- 05_delivery_by_state.sql
+-- Delivery funnel and delays by Brazilian state
+-- Concepts: PERCENTILE_CONT, COUNTIF, geo grouping
+-- ============================================================
+CREATE OR REPLACE VIEW `olist_raw.vw_delivery_by_state` AS
+SELECT
+  c.customer_state,
+  COUNT(DISTINCT o.order_id)              AS total_orders,
+  ROUND(AVG(TIMESTAMP_DIFF(
+    o.order_delivered_customer_date,
+    o.order_purchase_timestamp, DAY)), 1) AS avg_delivery_days,
+  ROUND(AVG(r.review_score), 2)           AS avg_review_score,
+  COUNTIF(
+    o.order_delivered_customer_date
+    > o.order_estimated_delivery_date)    AS late_deliveries,
+  ROUND(COUNTIF(
+    o.order_delivered_customer_date
+    > o.order_estimated_delivery_date
+  ) * 100.0 / COUNT(*), 1)               AS late_pct
+FROM `olist_raw.orders` o
+JOIN `olist_raw.customers` c
+  ON o.customer_id = c.customer_id
+JOIN `olist_raw.order_reviews` r
+  ON o.order_id = r.order_id
+WHERE o.order_status = 'delivered'
+  AND o.order_delivered_customer_date IS NOT NULL
+GROUP BY 1
+ORDER BY avg_delivery_days DESC;
+
+
+-- ============================================================
+-- 06_mart_orders_summary.sql
+-- Master denormalized table — connects to Looker Studio
+-- Concepts: Materialized TABLE, all joins combined
+-- ============================================================
+Create or replace table olist_raw.mart_orders_summary AS
+WITH clean_translation AS (
+  SELECT 
+    string_field_0 AS cat_pt, 
+    string_field_1 AS cat_en 
+  FROM `olist_raw.category_translation`
+  WHERE string_field_0 != 'product_category_name'
+)
+Select 
+   o.order_id,
+   o.order_status,
+   Date(o.order_purchase_timestamp) as order_date,
+   Date_trunc(o.order_purchase_timestamp, MONTH) as order_month,
+   c.customer_city,
+   c.customer_state,
+   COALESCE(t.cat_en,p.product_category_name, 'Unknown') as category,
+   s.seller_state,
+   ROUND(oi.price, 2) as item_price,
+   ROUND(pay.payment_value,2) as payment_value,
+   pay.payment_type,
+   r.review_score,
+   TIMESTAMP_DIFF(
+    o.order_delivered_customer_date,
+    o.order_purchase_timestamp, DAY) as deliver_days,
+  Case
+    when o.order_delivered_customer_date > o.order_estimated_delivery_date THEN 'Late' 
+    ELSE 'On Time'
+  END as delivery_status
+FROM olist_raw.orders o
+JOIN olist_raw.customers c on c.customer_id = o.customer_id
+JOIN olist_raw.order_items oi on o.order_id = oi.order_id
+JOIN olist_raw.products p on oi.product_id = p.product_id
+JOIN olist_raw.sellers s on oi.seller_id = s.seller_id
+JOIN olist_raw.order_payments pay on o.order_id = pay.order_id
+LEFT JOIN olist_raw.order_reviews r on o.order_id = r.order_id
+LEFT JOIN clean_translation t on t.cat_pt = p.product_category_name
+WHERE o.order_status = 'delivered';
